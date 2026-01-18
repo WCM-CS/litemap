@@ -6,37 +6,32 @@ use ph::{
     },
     seeds::BitsFast,
 };
-use std::{hash::Hash, marker::PhantomData};
+use std::{hash::Hash, marker::PhantomData, sync::Arc};
+use bumpalo::Bump;
 
-pub struct FrozenMap<K, V>
+pub struct FrozenMap<'w, K, V>
 where
     K: Hash + Eq + Send + Sync + Clone + Default,
     V: Send + Sync + Clone + Default,
 {
-    index: FrozenIndex<K>,
-    store: Store<V>,
+    index: Mphf,
+    keys: &'w [K],
+    values: &'w [V],
+    _arena: &'w Bump
 }
 
 type Mphf =
     Function2<BitsFast, ShiftOnlyWrapped<2>, DefaultCompressedArray, BuildDefaultSeededHasher>;
 
-pub struct FrozenIndex<K>
-where
-    K: Hash + Eq + Send + Sync + Clone + Default,
-{
-    pub mphf: Mphf,
-    pub keys: Store<K>,
-}
-
 
 // only use if the key value pair indexes line up properly
-impl<K, V> FrozenMap<K, V>
+impl<'w, K, V> FrozenMap<'w, K, V>
 where
     K: Hash + Eq + Send + Sync + Clone + Default,
     V: Send + Sync + Clone + Default,
 {
     #[inline]
-    pub fn init(keys: Vec<K>, values: Vec<V>) -> Self { // only use if the key value pair indexes line up properly
+    pub fn init(keys: &[K], values: &[V], arena: &'w Bump) -> Self { // only use if the key value pair indexes line up properly
         assert_eq!(keys.len(), values.len());
         // NOTE: all keys must be unqiue!!!
 
@@ -53,44 +48,33 @@ where
             ShiftOnlyWrapped::<2>,
         );
 
-        let mut sorted_keys: Vec<K> = vec![K::default(); keys.len()]; // initvec
-        let mut sorted_values: Vec<V> = vec![V::default(); values.len()];
-    
+        let sorted_keys = arena.alloc_slice_clone(keys); // clone we cannot assume copy, val migth be a strig or key
+        let sorted_values = arena.alloc_slice_clone(values);
 
-        for (k, v) in keys.into_iter().zip(values.into_iter()) {
+        for (k, v) in keys.iter().zip(values.iter()) {
             let idx = index_map.get(&k); 
 
-            sorted_keys[idx] = k;
-            sorted_values[idx] = v;
+            sorted_keys[idx] = k.clone();
+            sorted_values[idx] = v.clone();
         }
 
-        let frozen_index = FrozenIndex {
-            mphf: index_map,
-            keys: Store::new(sorted_keys)
-        };
-
-        let store = Store::new(sorted_values);
-
         Self {
-            index: frozen_index,
-            store,
+            index: index_map,
+            keys: sorted_keys,
+            values: sorted_values,
+            _arena: arena
         }
     }
 
 
     #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
-        let idx = self.index.mphf.get(key);
+        let idx = self.index.get(key);
 
-        match self.index.keys.get_value(idx) {
-            Some(k) => {
-                if k == key {
-                    self.store.get_value(idx)
-                } else {
-                    None
-                }
-            },
-            None => None,
+        if &self.keys[idx] == key {
+            Some(&self.values[idx])
+        } else {
+            None
         }
     }
 
@@ -98,68 +82,13 @@ where
 
     #[inline]
     pub fn contains(&self, key: &K) -> bool {
-        let idx = self.index.mphf.get(key);
+        let idx = self.index.get(key);
 
-        self.index.keys.get_value(idx) == Some(key)
+        &self.keys[idx] == key
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.index.keys.len
+        self.keys.len()
     }
 }
-
-
-
-
-pub struct Store<V>
-{
-    pub value_ptr: *const V,
-    pub len: usize,
-    _marker: PhantomData<V>
-}
-
-unsafe impl<V: Sync> Sync for Store<V> {}
-unsafe impl<V: Send> Send for Store<V> {}
-
-impl<V> Store<V>
-{
-    #[inline]
-    pub fn new(values: Vec<V>) -> Self {
-        let n = values.len();
-
-        let value_ptr = values.as_ptr();
-        std::mem::forget(values); // so it doesnt drop from mem after var is descoped
-
-
-        Self { value_ptr, len: n, _marker: PhantomData}
-    }
-
-    #[inline]
-    pub fn get_value(&self, idx: usize) -> Option<&V> {
-        if idx >= self.len { // check index bounds and value
-            None
-        } else {
-            unsafe { Some( &*self.value_ptr.add(idx) ) }
-        }
-    }
-}
-
-impl<V> Drop for Store<V>
-{
-    fn drop(&mut self) {
-        if self.len != 0 {
-            // assumes data is full otherwise undefined behaviore occcurs, so use unsafe init and dont delete vals until changed to store capacity in store with current len
-            unsafe { 
-                let _ = Vec::from_raw_parts(
-                    self.value_ptr as *mut V, 
-                    self.len, 
-                    self.len
-                ); 
-            }
-        }
-    }
-}
-
-
-
