@@ -6,18 +6,16 @@ use ph::{
     },
     seeds::BitsFast,
 };
-use std::{hash::Hash, marker::PhantomData, sync::Arc};
-use bumpalo::Bump;
+use std::{hash::Hash};
 
-pub struct FrozenMap<'w, K, V>
+pub struct LitMa<K, V>
 where
     K: Hash + Eq + Send + Sync + Clone + Default,
     V: Send + Sync + Clone + Default,
 {
-    index: Mphf,
-    keys: &'w [K],
-    values: &'w [V],
-    _arena: &'w Bump
+    keys: Box<[K]>,
+    values: Box<[V]>,
+    index: Mphf, // Structure this so the Index is last/cold since its only used once per lokup
 }
 
 type Mphf =
@@ -25,16 +23,24 @@ type Mphf =
 
 
 // only use if the key value pair indexes line up properly
-impl<'w, K, V> FrozenMap<'w, K, V>
+impl<K, V> LitMa<K, V>
 where
     K: Hash + Eq + Send + Sync + Clone + Default,
     V: Send + Sync + Clone + Default,
 {
-    #[inline]
-    pub fn init(keys: &[K], values: &[V], arena: &'w Bump) -> Self { // only use if the key value pair indexes line up properly
-        assert_eq!(keys.len(), values.len());
-        // NOTE: all keys must be unqiue!!!
+    //#[inline]
+    pub fn init(keys: Vec<K>, values: Vec<V>) -> Self { // only use if the key value pair indexes line up properly
+        let n = keys.len();
+        assert_eq!(n, values.len());
 
+        let (bits, bucket_bits): (BitsFast, u8) = match n {
+            0..=1000 => (BitsFast(10), 8),
+            1001..=10_000 => (BitsFast(12), 10),
+            10_001..=100_000 => (BitsFast(14), 12),
+            _ => (BitsFast(16), 14), // 100K+
+        };
+
+        // MPHF creation
         let index_map: Function2<
             BitsFast,
             ShiftOnlyWrapped<2>,
@@ -42,32 +48,30 @@ where
             BuildDefaultSeededHasher,
         > = Function2::with_slice_p_threads_hash_sc(
             &keys,
-            &Params::new(BitsFast(10), bits_per_seed_to_100_bucket_size(8)),
+            &Params::new(bits, bits_per_seed_to_100_bucket_size(bucket_bits)),
             std::thread::available_parallelism().map_or(1, |v| v.into()),
             BuildDefaultSeededHasher::default(),
             ShiftOnlyWrapped::<2>,
         );
 
-        let sorted_keys = arena.alloc_slice_clone(keys); // clone we cannot assume copy, val migth be a strig or key
-        let sorted_values = arena.alloc_slice_clone(values);
+        let mut sorted_keys: Vec<K> = vec![K::default(); n];
+        let mut sorted_values: Vec<V> = vec![V::default(); n];
 
-        for (k, v) in keys.iter().zip(values.iter()) {
+        for (k, v) in keys.into_iter().zip(values.into_iter()) {
             let idx = index_map.get(&k); 
 
-            sorted_keys[idx] = k.clone();
-            sorted_values[idx] = v.clone();
+            sorted_keys[idx] = k;
+            sorted_values[idx] = v;
         }
 
         Self {
             index: index_map,
-            keys: sorted_keys,
-            values: sorted_values,
-            _arena: arena
+            keys: sorted_keys.into_boxed_slice(),
+            values: sorted_values.into_boxed_slice()
         }
     }
 
-
-    #[inline]
+    #[inline(always)]
     pub fn get(&self, key: &K) -> Option<&V> {
         let idx = self.index.get(key);
 
@@ -78,9 +82,7 @@ where
         }
     }
 
- 
-
-    #[inline]
+    #[inline(always)]
     pub fn contains(&self, key: &K) -> bool {
         let idx = self.index.get(key);
 
